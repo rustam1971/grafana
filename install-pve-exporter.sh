@@ -1,0 +1,193 @@
+#!/bin/bash
+#===============================================================
+# install-pve-exporter.sh
+# Install prometheus-pve-exporter di node Proxmox VE
+# (python venv + systemd service, listen di port 9221)
+#
+# Interactive (tanya kredensial API token):
+#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana-install/main/install-pve-exporter.sh | bash
+#
+# Non-interactive:
+#   PVE_TOKEN_VALUE=xxxx-xxxx bash install-pve-exporter.sh --force
+#   Variabel env yang bisa di-set:
+#     PVE_HOST         (default: localhost)
+#     PVE_USER         (default: pve-exporter@pve)
+#     PVE_TOKEN_NAME   (default: exporter)
+#     PVE_TOKEN_VALUE  (wajib di mode --force, kecuali --create-token)
+#     LISTEN_PORT      (default: 9221)
+#
+#   Auto-create user + token di node PVE (tidak perlu input token):
+#     bash install-pve-exporter.sh --force --create-token
+#===============================================================
+set -euo pipefail
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[OK]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+err()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# --- Default ---
+FORCE="${FORCE:-0}"
+CREATE_TOKEN="${CREATE_TOKEN:-0}"
+PVE_HOST="${PVE_HOST:-localhost}"
+PVE_USER="${PVE_USER:-pve-exporter@pve}"
+PVE_TOKEN_NAME="${PVE_TOKEN_NAME:-exporter}"
+PVE_TOKEN_VALUE="${PVE_TOKEN_VALUE:-}"
+LISTEN_PORT="${LISTEN_PORT:-9221}"
+
+INSTALL_DIR="/opt/prometheus-pve-exporter"
+CONFIG_DIR="/etc/prometheus"
+CONFIG_FILE="${CONFIG_DIR}/pve.yml"
+SERVICE_FILE="/etc/systemd/system/prometheus-pve-exporter.service"
+RUN_USER="pve-exporter"
+
+# --- Parse argumen ---
+for arg in "$@"; do
+    case "$arg" in
+        -f|--force|-y|--yes) FORCE=1 ;;
+        --create-token)      CREATE_TOKEN=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--force] [--create-token]"
+            echo "  --force, -f, -y   Non-interactive (butuh PVE_TOKEN_VALUE atau --create-token)"
+            echo "  --create-token    Buat user & API token otomatis via pveum (jalankan di node PVE)"
+            exit 0
+            ;;
+    esac
+done
+
+# --- Cek root & OS ---
+[ "$(id -u)" -eq 0 ] || err "Script harus dijalankan sebagai root"
+command -v apt-get >/dev/null 2>&1 || err "Hanya support Debian-based (Proxmox VE)"
+
+# --- Cek existing install ---
+if systemctl list-unit-files 2>/dev/null | grep -q '^prometheus-pve-exporter.service'; then
+    warn "prometheus-pve-exporter sudah terinstall"
+    if [ "$FORCE" = "1" ]; then
+        log "Mode --force: lanjut reinstall/upgrade"
+    elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+        read -rp "Lanjut reinstall/upgrade? (y/N): " CONFIRM </dev/tty
+        [[ "${CONFIRM,,}" == "y" ]] || { warn "Dibatalkan."; exit 0; }
+    else
+        err "Tidak ada TTY. Jalankan ulang dengan --force"
+    fi
+fi
+
+# --- Buat API token otomatis (opsional, hanya di node PVE) ---
+if [ "$CREATE_TOKEN" = "1" ]; then
+    command -v pveum >/dev/null 2>&1 || err "--create-token butuh pveum (jalankan di node Proxmox)"
+    log "Membuat user & API token via pveum..."
+    pveum user add "$PVE_USER" --comment "Prometheus PVE Exporter" 2>/dev/null \
+        && log "User $PVE_USER dibuat" \
+        || warn "User $PVE_USER sudah ada, skip"
+    pveum acl modify / --users "$PVE_USER" --roles PVEAuditor
+    # Hapus token lama jika ada, lalu buat baru
+    pveum user token remove "$PVE_USER" "$PVE_TOKEN_NAME" 2>/dev/null || true
+    TOKEN_OUTPUT=$(pveum user token add "$PVE_USER" "$PVE_TOKEN_NAME" --privsep 0 --output-format json)
+    PVE_TOKEN_VALUE=$(echo "$TOKEN_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+    [ -n "$PVE_TOKEN_VALUE" ] || err "Gagal membuat API token"
+    log "Token dibuat: ${PVE_USER}!${PVE_TOKEN_NAME}"
+fi
+
+# --- Input token (interactive) ---
+if [ -z "$PVE_TOKEN_VALUE" ]; then
+    if [ "$FORCE" = "1" ]; then
+        err "PVE_TOKEN_VALUE belum di-set. Gunakan env PVE_TOKEN_VALUE=xxx atau --create-token"
+    elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+        echo ""
+        echo "Konfigurasi koneksi ke Proxmox API:"
+        read -rp "  PVE host [${PVE_HOST}]: " IN </dev/tty; PVE_HOST="${IN:-$PVE_HOST}"
+        read -rp "  PVE user [${PVE_USER}]: " IN </dev/tty; PVE_USER="${IN:-$PVE_USER}"
+        read -rp "  Token name [${PVE_TOKEN_NAME}]: " IN </dev/tty; PVE_TOKEN_NAME="${IN:-$PVE_TOKEN_NAME}"
+        read -rsp "  Token value: " PVE_TOKEN_VALUE </dev/tty; echo ""
+        [ -n "$PVE_TOKEN_VALUE" ] || err "Token value tidak boleh kosong"
+    else
+        err "Tidak ada TTY untuk input token. Set env PVE_TOKEN_VALUE atau pakai --create-token"
+    fi
+fi
+
+# --- Install dependencies ---
+log "Install dependencies (python3-venv)..."
+apt-get update -qq
+apt-get install -y -qq python3 python3-venv python3-pip
+
+# --- Buat user sistem ---
+if ! id "$RUN_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER"
+    log "User sistem '$RUN_USER' dibuat"
+fi
+
+# --- Install via venv ---
+log "Install prometheus-pve-exporter di ${INSTALL_DIR}..."
+python3 -m venv "$INSTALL_DIR"
+"$INSTALL_DIR/bin/pip" install --quiet --upgrade pip
+"$INSTALL_DIR/bin/pip" install --quiet --upgrade prometheus-pve-exporter
+VERSION=$("$INSTALL_DIR/bin/pip" show prometheus-pve-exporter | awk '/^Version:/{print $2}')
+
+# --- Tulis config ---
+log "Menulis config ${CONFIG_FILE}..."
+mkdir -p "$CONFIG_DIR"
+cat > "$CONFIG_FILE" <<EOF
+default:
+    user: ${PVE_USER}
+    token_name: ${PVE_TOKEN_NAME}
+    token_value: ${PVE_TOKEN_VALUE}
+    verify_ssl: false
+EOF
+chown "$RUN_USER":"$RUN_USER" "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
+
+# --- Systemd service ---
+log "Membuat systemd service..."
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Prometheus Proxmox VE Exporter
+Documentation=https://github.com/prometheus-pve/prometheus-pve-exporter
+After=network.target
+
+[Service]
+User=${RUN_USER}
+Group=${RUN_USER}
+ExecStart=${INSTALL_DIR}/bin/pve_exporter --config.file=${CONFIG_FILE} --web.listen-address=:${LISTEN_PORT}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=${CONFIG_FILE}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now prometheus-pve-exporter
+
+# --- Verifikasi ---
+sleep 3
+if systemctl is-active --quiet prometheus-pve-exporter; then
+    IP=$(hostname -I | awk '{print $1}')
+    echo ""
+    echo "==============================================="
+    log "prometheus-pve-exporter v${VERSION} berhasil terinstall!"
+    echo "  Metrics : http://${IP}:${LISTEN_PORT}/pve?target=${PVE_HOST}"
+    echo "  Config  : ${CONFIG_FILE}"
+    echo "  Service : systemctl status prometheus-pve-exporter"
+    echo "==============================================="
+    echo ""
+    echo "Contoh scrape config VictoriaMetrics:"
+    echo "  - job_name: 'pve'"
+    echo "    static_configs:"
+    echo "      - targets: ['${PVE_HOST}']"
+    echo "    metrics_path: /pve"
+    echo "    params:"
+    echo "      module: [default]"
+    echo "    relabel_configs:"
+    echo "      - source_labels: [__address__]"
+    echo "        target_label: __param_target"
+    echo "      - source_labels: [__param_target]"
+    echo "        target_label: instance"
+    echo "      - target_label: __address__"
+    echo "        replacement: ${IP}:${LISTEN_PORT}"
+else
+    err "Service gagal start. Cek: journalctl -u prometheus-pve-exporter -n 50"
+fi
