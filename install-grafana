@@ -3,7 +3,7 @@
 # install-grafana.sh
 # Install Grafana OSS (stable) untuk Ubuntu/Debian
 # Usage:
-#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana/main/install-grafana.sh | bash
+#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana/main/install-grafana | bash
 #===============================================================
 set -euo pipefail
 
