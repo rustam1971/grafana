@@ -152,6 +152,7 @@ Restart=always
 RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
+PrivateTmp=true
 ProtectHome=true
 ReadOnlyPaths=${CONFIG_FILE}
 
