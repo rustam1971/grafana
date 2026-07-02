@@ -1,0 +1,215 @@
+#!/bin/bash
+#===============================================================
+# install-victoriametrics.sh
+# Install VictoriaMetrics single-binary (dengan built-in scraper)
+# untuk Ubuntu/Debian — systemd service, listen di port 8428
+#
+# Interactive:
+#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana-install/main/install-victoriametrics.sh | bash
+#
+# Non-interactive:
+#   wget -qO- .../install-victoriametrics.sh | bash -s -- --force
+#
+#   Variabel env yang bisa di-set:
+#     VM_VERSION    (default: latest, contoh: v1.146.0)
+#     DATA_DIR      (default: /var/lib/victoriametrics)
+#     RETENTION     (default: 2y)
+#     LISTEN_PORT   (default: 8428)
+#===============================================================
+set -euo pipefail
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[OK]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+err()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# --- Default ---
+FORCE="${FORCE:-0}"
+VM_VERSION="${VM_VERSION:-latest}"
+DATA_DIR="${DATA_DIR:-/var/lib/victoriametrics}"
+RETENTION="${RETENTION:-2y}"
+LISTEN_PORT="${LISTEN_PORT:-8428}"
+
+BIN_PATH="/usr/local/bin/victoria-metrics"
+CONFIG_DIR="/etc/victoriametrics"
+SCRAPE_CONFIG="${CONFIG_DIR}/scrape.yml"
+SERVICE_FILE="/etc/systemd/system/victoriametrics.service"
+RUN_USER="victoriametrics"
+
+# --- Parse argumen ---
+for arg in "$@"; do
+    case "$arg" in
+        -f|--force|-y|--yes) FORCE=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--force]"
+            echo "  --force, -f, -y   Non-interactive, langsung install/upgrade"
+            echo "Env: VM_VERSION, DATA_DIR, RETENTION, LISTEN_PORT"
+            exit 0
+            ;;
+    esac
+done
+
+# --- Cek root & OS ---
+[ "$(id -u)" -eq 0 ] || err "Script harus dijalankan sebagai root"
+command -v apt-get >/dev/null 2>&1 || err "Hanya support Ubuntu/Debian"
+
+# --- Deteksi arsitektur ---
+case "$(uname -m)" in
+    x86_64)  ARCH="amd64" ;;
+    aarch64) ARCH="arm64" ;;
+    *) err "Arsitektur $(uname -m) tidak didukung" ;;
+esac
+
+# --- Cek existing install ---
+EXISTING=0
+if [ -x "$BIN_PATH" ]; then
+    EXISTING=1
+    CURRENT_VER=$("$BIN_PATH" --version 2>/dev/null | grep -oP 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+    warn "VictoriaMetrics sudah terinstall: ${CURRENT_VER}"
+    if [ "$FORCE" = "1" ]; then
+        log "Mode --force: lanjut upgrade"
+    elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+        read -rp "Lanjut upgrade? Data & config tidak dihapus (y/N): " CONFIRM </dev/tty
+        [[ "${CONFIRM,,}" == "y" ]] || { warn "Dibatalkan."; exit 0; }
+    else
+        err "Tidak ada TTY. Jalankan ulang dengan --force"
+    fi
+fi
+
+# --- Konfigurasi interactive ---
+if [ "$FORCE" != "1" ] && [ -e /dev/tty ] && [ -r /dev/tty ]; then
+    echo ""
+    echo "Konfigurasi VictoriaMetrics (Enter untuk pakai default):"
+    read -rp "  Data dir  [${DATA_DIR}]: " IN </dev/tty; DATA_DIR="${IN:-$DATA_DIR}"
+    read -rp "  Retention [${RETENTION}]: " IN </dev/tty; RETENTION="${IN:-$RETENTION}"
+    read -rp "  Port      [${LISTEN_PORT}]: " IN </dev/tty; LISTEN_PORT="${IN:-$LISTEN_PORT}"
+fi
+
+# --- Install dependencies ---
+apt-get update -qq
+apt-get install -y -qq wget curl tar
+
+# --- Tentukan versi ---
+if [ "$VM_VERSION" = "latest" ]; then
+    log "Mengecek versi terbaru..."
+    VM_VERSION=$(curl -sI https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest \
+        | grep -i '^location' | grep -oP 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [ -n "$VM_VERSION" ] || err "Gagal mendeteksi versi terbaru. Set manual: VM_VERSION=v1.146.0"
+fi
+log "Versi target: ${VM_VERSION}"
+
+# --- Download binary ---
+TARBALL="victoria-metrics-linux-${ARCH}-${VM_VERSION}.tar.gz"
+URL="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${VM_VERSION}/${TARBALL}"
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+log "Download ${TARBALL}..."
+wget -q -O "${TMPDIR}/${TARBALL}" "$URL" || err "Download gagal: $URL"
+tar xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
+
+# --- Buat user sistem & direktori ---
+if ! id "$RUN_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER"
+    log "User sistem '$RUN_USER' dibuat"
+fi
+mkdir -p "$DATA_DIR" "$CONFIG_DIR"
+chown -R "$RUN_USER":"$RUN_USER" "$DATA_DIR"
+
+# --- Pasang binary (stop service dulu jika upgrade) ---
+if [ "$EXISTING" = "1" ] && systemctl is-active --quiet victoriametrics 2>/dev/null; then
+    log "Stop service untuk upgrade..."
+    systemctl stop victoriametrics
+fi
+install -m 755 "${TMPDIR}/victoria-metrics-prod" "$BIN_PATH"
+log "Binary terpasang di ${BIN_PATH}"
+
+# --- Scrape config default (tidak menimpa jika sudah ada) ---
+if [ ! -f "$SCRAPE_CONFIG" ]; then
+    log "Membuat scrape config default ${SCRAPE_CONFIG}..."
+    cat > "$SCRAPE_CONFIG" <<EOF
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # Self-monitoring VictoriaMetrics
+  - job_name: victoriametrics
+    static_configs:
+      - targets: ['localhost:${LISTEN_PORT}']
+
+  # Contoh: node_exporter
+  # - job_name: node
+  #   static_configs:
+  #     - targets: ['10.10.0.11:9100', '10.10.0.12:9100']
+
+  # Contoh: prometheus-pve-exporter (multi-target)
+  # - job_name: pve
+  #   metrics_path: /pve
+  #   params:
+  #     module: [default]
+  #   static_configs:
+  #     - targets: ['pve-node-1', 'pve-node-2']
+  #   relabel_configs:
+  #     - source_labels: [__address__]
+  #       target_label: __param_target
+  #     - source_labels: [__param_target]
+  #       target_label: instance
+  #     - target_label: __address__
+  #       replacement: 127.0.0.1:9221
+EOF
+    chown "$RUN_USER":"$RUN_USER" "$SCRAPE_CONFIG"
+else
+    warn "Scrape config sudah ada, tidak ditimpa: ${SCRAPE_CONFIG}"
+fi
+
+# --- Systemd service ---
+log "Membuat systemd service..."
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=VictoriaMetrics time series database
+Documentation=https://docs.victoriametrics.com
+After=network.target
+
+[Service]
+User=${RUN_USER}
+Group=${RUN_USER}
+ExecStart=${BIN_PATH} \\
+    -storageDataPath=${DATA_DIR} \\
+    -retentionPeriod=${RETENTION} \\
+    -httpListenAddr=:${LISTEN_PORT} \\
+    -promscrape.config=${SCRAPE_CONFIG} \\
+    -promscrape.config.strictParse=false
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${DATA_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now victoriametrics
+
+# --- Verifikasi ---
+sleep 3
+if systemctl is-active --quiet victoriametrics; then
+    IP=$(hostname -I | awk '{print $1}')
+    echo ""
+    echo "==============================================="
+    log "VictoriaMetrics ${VM_VERSION} berhasil terinstall!"
+    echo "  UI/API    : http://${IP}:${LISTEN_PORT}"
+    echo "  vmui      : http://${IP}:${LISTEN_PORT}/vmui"
+    echo "  Data dir  : ${DATA_DIR}"
+    echo "  Retention : ${RETENTION}"
+    echo "  Scrape    : ${SCRAPE_CONFIG} (reload: systemctl reload victoriametrics)"
+    echo "==============================================="
+    echo ""
+    echo "Datasource Grafana: pilih tipe 'Prometheus', URL http://${IP}:${LISTEN_PORT}"
+else
+    err "Service gagal start. Cek: journalctl -u victoriametrics -n 50"
+fi
