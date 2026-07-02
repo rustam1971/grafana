@@ -5,7 +5,7 @@
 # (python venv + systemd service, listen di port 9221)
 #
 # Interactive (tanya kredensial API token):
-#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana/main/install-pve-exporter.sh | bash
+#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana/main/install-pve-exporter | bash
 #
 # Non-interactive:
 #   PVE_TOKEN_VALUE=xxxx-xxxx bash install-pve-exporter.sh --force
