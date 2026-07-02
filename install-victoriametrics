@@ -5,7 +5,7 @@
 # untuk Ubuntu/Debian — systemd service, listen di port 8428
 #
 # Interactive:
-#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana/main/install-victoriametrics.sh | bash
+#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana/main/install-victoriametrics | bash
 #
 # Non-interactive:
 #   wget -qO- .../install-victoriametrics.sh | bash -s -- --force
