@@ -5,4 +5,4 @@ apt update
 apt install -y grafana
 systemctl enable --now grafana-server
 
-default user: admin/admin
+echo "default user: admin/admin"
