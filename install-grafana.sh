@@ -1,0 +1,66 @@
+#!/bin/bash
+#===============================================================
+# install-grafana.sh
+# Install Grafana OSS (stable) untuk Ubuntu/Debian
+# Usage:
+#   wget -qO- https://raw.githubusercontent.com/rustam1971/grafana/install-grafana.sh | bash
+#===============================================================
+set -euo pipefail
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[OK]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+err()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# --- Cek root ---
+[ "$(id -u)" -eq 0 ] || err "Script harus dijalankan sebagai root"
+
+# --- Cek OS ---
+command -v apt-get >/dev/null 2>&1 || err "Hanya support Ubuntu/Debian (apt)"
+
+# --- Cek apakah Grafana sudah terinstall ---
+if command -v grafana-server >/dev/null 2>&1; then
+    warn "Grafana sudah terinstall: $(grafana-server -v 2>/dev/null | head -1)"
+    read -rp "Lanjut upgrade/reinstall? (y/N): " CONFIRM </dev/tty || CONFIRM="y"
+    [[ "${CONFIRM,,}" == "y" ]] || exit 0
+fi
+
+# --- Install dependencies ---
+log "Update apt & install dependencies..."
+apt-get update -qq
+apt-get install -y -qq apt-transport-https software-properties-common wget gnupg
+
+# --- Tambah GPG key & repo Grafana ---
+log "Menambahkan GPG key Grafana..."
+mkdir -p /usr/share/keyrings
+wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor > /usr/share/keyrings/grafana.gpg
+
+log "Menambahkan repository Grafana..."
+echo "deb [signed-by=/usr/share/keyrings/grafana.gpg] https://apt.grafana.com stable main" \
+    > /etc/apt/sources.list.d/grafana.list
+
+# --- Install Grafana ---
+log "Install Grafana..."
+apt-get update -qq
+apt-get install -y grafana
+
+# --- Enable & start service ---
+log "Enable & start grafana-server..."
+systemctl daemon-reload
+systemctl enable --now grafana-server
+
+# --- Verifikasi ---
+sleep 2
+if systemctl is-active --quiet grafana-server; then
+    IP=$(hostname -I | awk '{print $1}')
+    VERSION=$(grafana-server -v 2>/dev/null | head -1 || echo "unknown")
+    echo ""
+    echo "==============================================="
+    log "Grafana berhasil terinstall!"
+    echo "  Versi   : ${VERSION}"
+    echo "  URL     : http://${IP}:3000"
+    echo "  Login   : admin / admin (wajib ganti saat login pertama)"
+    echo "==============================================="
+else
+    err "grafana-server gagal start. Cek: journalctl -u grafana-server -n 50"
+fi
